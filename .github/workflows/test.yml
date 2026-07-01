@@ -1,0 +1,117 @@
+name: Manual Build and Run Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      remarks:
+        description: '运行备注（可选）'
+        required: false
+        default: '手动触发验证'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. 构建镜像（保留你的 3 次重试机制）
+      - name: Build Docker Image with Retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_on: error
+          command: |
+            REPO_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+            docker build -t "$REPO_NAME":latest .
+
+      # 2. 动态生成测试脚本并直接在容器中运行
+      - name: Run Test Logic Inside Container
+        run: |
+          REPO_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          # 在宿主机本地动态生成临时脚本
+          cat << 'EOF' > inline_test.sh
+          #!/bin/bash
+          # 移除 set -e，手动控制状态码
+          set -u
+          
+          # 强制刷新标准输出，防止日志缓冲导致"假卡死"
+          export PYTHONUNBUFFERED=1
+
+          echo "=== 开始自动化验证流程 ==="
+
+          # 进入 /testbed 路径
+          cd /testbed || { echo "❌ 无法进入 /testbed"; exit 1; }
+
+          # 进入 /testbed 下的唯一文件夹
+          SUB_DIR=$(find . -maxdepth 1 -type d ! -path . | head -n 1)
+          if [ -z "$SUB_DIR" ]; then
+              echo "❌ 错误：/testbed 下没有找到任何文件夹！"
+              exit 1
+          fi
+          cd "$SUB_DIR" && echo "已进入工作目录: $(pwd)"
+
+          # 解析 test.patch 获取 py 脚本路径
+          PY_FILES=$(grep -E '^(--- a/|\+\+\+ b/)' ../test.patch | grep '\.py' | sed -E 's/^[^/]+\///' | sort -u | tr '\n' ' ')
+          if [ -z "$PY_FILES" ]; then
+              echo "❌ 错误：未能从 test.patch 中解析出 .py 脚本文件！"
+              exit 1
+          fi
+          echo "解析出的测试脚本为: $PY_FILES"
+
+
+          # 阶段 1：初始环境验证（预期应该全部通过，即退出码为 0）
+          echo "--> 正在执行：阶段 1 初始测试（预期 Pass）..."
+          pytest -vs $PY_FILES
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+              echo "❌ 测试环境验证失败-阶段 1：初始测试未完全通过 (Exit code: $EXIT_CODE)"
+              exit 1
+          fi
+
+
+          # 阶段 2：应用测试补丁验证（预期应该有测试失败，即退出码为 1 或其他非 0）
+          echo "--> 正在执行：阶段 2 应用 test.patch（预期 Fail）..."
+          git apply -v ../test.patch || { echo "❌ test.patch 应用失败"; exit 1; }
+          
+          pytest -vs $PY_FILES
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -eq 0 ]; then
+              echo "❌ 测试环境验证失败-阶段 2：引入测试补丁后，测试居然全部通过了！"
+              exit 1
+          fi
+
+
+          # 阶段 3：应用代码修复验证（预期应该重新全部通过，即退出码为 0）
+          echo "--> 正在执行：阶段 3 应用 code.patch（预期 Pass）..."
+          git apply -v ../code.patch || { echo "❌ code.patch 应用失败"; exit 1; }
+          
+          pytest -vs $PY_FILES
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+              echo "❌ 测试环境验证失败-阶段 3：应用修复补丁后，测试依然有失败 (Exit code: $EXIT_CODE)"
+              exit 1
+          fi
+
+          echo "=================================="
+          echo "🎉 验证成功！所有阶段均符合预期。"
+          echo "=================================="
+          exit 0
+          EOF
+
+          # 赋予临时脚本执行权限
+          chmod +x inline_test.sh
+
+          # 启动容器：挂载 patch 文件以及 inline_test.sh
+          docker run --rm \
+            -v $(pwd)/test.patch:/testbed/test.patch \
+            -v $(pwd)/code.patch:/testbed/code.patch \
+            -v $(pwd)/inline_test.sh:/inline_test.sh \
+            --entrypoint /inline_test.sh \
+            "$REPO_NAME":latest
