@@ -1,0 +1,116 @@
+name: Build Docker Image & Upload
+
+# 移除了 push 触发器，仅保留手动触发
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 赋予脚本执行权限
+      - name: Add execute permission for shell scripts
+        run: chmod +x *.sh
+
+      # 校验必需文件
+      - name: Verify required files
+        run: |
+          set -e
+          REQUIRED=(Dockerfile setup_env.sh setup_repo.sh)
+          for f in "${REQUIRED[@]}"; do
+            if [[ ! -f "$f" ]]; then
+              echo "::error file=$f::Missing required file: $f"
+              exit 1
+            fi
+          done
+
+      # 解析镜像名 + 合法标签 + 生成构建时间戳
+      - name: Set image name and valid tag
+        id: image_meta
+        run: |
+          set -e
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          REF="${GITHUB_REF}"
+          IS_TAG=false
+
+          if [[ "${REF}" == refs/tags/* ]]; then
+            IMG_TAG="${REF#refs/tags/}"
+            IS_TAG=true
+          else
+            BRANCH="${REF#refs/heads/}"
+            IMG_TAG="${BRANCH//\//_}"
+          fi
+
+          echo "IMAGE_NAME=${REPO_NAME}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${IMG_TAG}" >> $GITHUB_OUTPUT
+          echo "IS_TAG=${IS_TAG}" >> $GITHUB_OUTPUT
+
+          # 生成精准到秒的时间戳，解决非 Tag 构建时的 Release 重名冲突问题
+          echo "BUILD_TIME=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      # 构建镜像（3次重试）
+      - name: Build Docker image
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 30
+          timeout_minutes: 30
+          command: |
+            docker build --progress plain -t ${{ steps.image_meta.outputs.IMAGE_NAME }}:${{ steps.image_meta.outputs.IMAGE_TAG }} .
+
+      # 直接流式导出 + 压缩 + 分卷，无中间 tar 文件
+      - name: Compress and split image
+        id: handle_file
+        run: |
+          set -e
+          IMG_NAME=${{ steps.image_meta.outputs.IMAGE_NAME }}
+          IMG_TAG=${{ steps.image_meta.outputs.IMAGE_TAG }}
+          PREFIX="${IMG_NAME}-${IMG_TAG}.tar.gz.part"
+          mkdir -p dist
+
+          # 流式：save → gzip → split 1800M 分卷
+          docker save "${IMG_NAME}:${IMG_TAG}" | gzip | split -b 1800M - "dist/${PREFIX}"
+
+          echo "=== Generated Assets ==="
+          ls -lh dist/
+
+          # 写入上传路径
+          echo "UPLOAD_PATHS<<EOF" >> $GITHUB_ENV
+          ls -d dist/* >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      # 1. 上传到 Actions Artifacts
+      - name: Upload to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-package
+          path: ${{ env.UPLOAD_PATHS }}
+          retention-days: 30
+
+      # 2. 自动创建 Release 并上传分卷文件
+      - name: Create Release & Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.UPLOAD_PATHS }}
+          tag_name: ${{ steps.image_meta.outputs.IS_TAG == 'true' && steps.image_meta.outputs.IMAGE_TAG || format('{0}-{1}', steps.image_meta.outputs.IMAGE_TAG, steps.image_meta.outputs.BUILD_TIME) }}
+          name: ${{ steps.image_meta.outputs.IS_TAG == 'true' && steps.image_meta.outputs.IMAGE_TAG || format('Build {0} ({1})', steps.image_meta.outputs.IMAGE_TAG, steps.image_meta.outputs.BUILD_TIME) }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3. 清理构建文件
+      - name: Clean up build artifacts
+        if: always()
+        run: |
+          echo "=== Starting Cleanup ==="
+          if [ -d "dist" ]; then
+            rm -rf dist
+          fi
+          echo "=== Cleanup Completed ==="
